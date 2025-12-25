@@ -84,6 +84,7 @@ class D4RTTestLit(L.LightningModule):
         t_tgt = batch['t_tgt']
         t_cam = batch['t_cam']
         aspect_ratio = batch.get('aspect_ratio', None)
+        video_orig = batch.get('video_orig', None)  # Original resolution video for patch extraction
         
         outputs = self.model(
             video=video,
@@ -91,7 +92,8 @@ class D4RTTestLit(L.LightningModule):
             t_src=t_src,
             t_tgt=t_tgt,
             t_cam=t_cam,
-            aspect_ratio=aspect_ratio
+            aspect_ratio=aspect_ratio,
+            video_orig=video_orig
         )
         
         return outputs

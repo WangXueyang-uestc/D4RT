@@ -114,24 +114,47 @@ class LocalRGBPatchEmbedding(nn.Module):
         patches = patches.reshape(B, N, C, self.patch_size, self.patch_size)
         return patches
     
-    def forward(self, images, coords, t_src):
+    def forward(self, images, coords, t_src, video_resized=None):
         """
+        Extract and embed RGB patches for query building.
+        
+        NOTE (D4RT Paper Appendix C): For high-resolution inference, RGB patches 
+        should be extracted from the original high-resolution video, not from the 
+        resized 256x256 video. This significantly improves subpixel accuracy for 
+        edge and detail reconstruction. The encoder still runs at 256x256, but 
+        patch extraction for queries uses the original resolution.
+        
         Args:
-            images: (B, T, C, H, W) video frames
-            coords: (B, N, 2) normalized coordinates
+            images: (B, T, C, H, W) video frames (original resolution)
+            coords: (B, N, 2) normalized coordinates in [0, 1] (relative to resized video)
             t_src: (B, N) source frame indices
+            video_resized: optional (B, T, C, H_resized, W_resized) resized video for coordinate mapping
         Returns:
             embedded: (B, N, embedding_dim)
         """
-        B, T, C, H, W = images.shape
+        B, T, C, H, W = images.shape  # Original resolution
         N = coords.shape[1]
         
-        # Extract patches (using t_src to select source frame)
-        patches_list = []
-        pixel_coords = coords * torch.tensor([W, H], device=coords.device, dtype=coords.dtype)
+        # Map coordinates from resized video space to original video space
+        # coords are normalized [0,1] relative to resized video (256x256)
+        # For simple resize (no crop/augmentation), directly scale to original resolution
+        # NOTE: If data augmentation (especially crop) is used, coordinate mapping becomes complex
+        # This implementation assumes simple resize relationship. For augmentation case,
+        # the coordinates may not map correctly to original image if crop was applied.
+        if video_resized is not None:
+            # coords_uv is normalized [0,1], multiply by original resolution to get original pixel coords
+            # This works for simple resize: coords_uv * [W_orig, H_orig] gives original pixel coordinates
+            pixel_coords = coords * torch.tensor([W, H], device=coords.device, dtype=coords.dtype)
+        else:
+            # If no resized video provided, assume coords are relative to original resolution
+            pixel_coords = coords * torch.tensor([W, H], device=coords.device, dtype=coords.dtype)
+        
         pixel_coords = pixel_coords.round().long()
         pixel_coords[:, :, 0] = torch.clamp(pixel_coords[:, :, 0], self.half_patch, W - self.half_patch - 1)
         pixel_coords[:, :, 1] = torch.clamp(pixel_coords[:, :, 1], self.half_patch, H - self.half_patch - 1)
+        
+        # Extract patches (using t_src to select source frame)
+        patches_list = []
         
         for b in range(B):
             for n in range(N):
@@ -196,23 +219,24 @@ class QueryBuilder(nn.Module):
         total_dim = fourier_dim + 3 * time_embed_dim + patch_embed_dim
         self.query_proj = nn.Linear(total_dim, query_dim)
     
-    def forward(self, images, coords_uv, t_src, t_tgt, t_cam):
+    def forward(self, images, coords_uv, t_src, t_tgt, t_cam, video_resized=None):
         """
         Build query vectors from components
         
         Args:
-            images: (B, T, C, H, W) video frames
-            coords_uv: (B, N, 2) normalized 2D coordinates in [0, 1]
+            images: (B, T, C, H, W) video frames (original resolution for patch extraction)
+            coords_uv: (B, N, 2) normalized 2D coordinates in [0, 1] (relative to resized video)
             t_src: (B, N) source frame indices (long tensor)
             t_tgt: (B, N) target frame indices (long tensor)
             t_cam: (B, N) camera reference frame indices (long tensor)
+            video_resized: optional (B, T, C, H_resized, W_resized) resized video for coordinate mapping
         
         Returns:
             queries: (B, N, query_dim) query vectors
         """
         B, N = coords_uv.shape[:2]
         
-        # Fourier features for (u, v)
+        # Fourier features for (u, v) - use coordinates from resized video
         fourier_feat = self.fourier_embed(coords_uv)  # (B, N, fourier_dim)
         
         # Time embeddings
@@ -220,8 +244,9 @@ class QueryBuilder(nn.Module):
         t_tgt_emb = self.t_tgt_embed(t_tgt)  # (B, N, time_embed_dim)
         t_cam_emb = self.t_cam_embed(t_cam)  # (B, N, time_embed_dim)
         
-        # Local RGB patch embedding
-        patch_feat = self.patch_embed(images, coords_uv, t_src)  # (B, N, patch_embed_dim)
+        # Local RGB patch embedding - extract from original resolution if available
+        # coords_uv are relative to resized video, need to map to original resolution
+        patch_feat = self.patch_embed(images, coords_uv, t_src, video_resized=video_resized)  # (B, N, patch_embed_dim)
         
         # Concatenate all features
         query_features = torch.cat([
