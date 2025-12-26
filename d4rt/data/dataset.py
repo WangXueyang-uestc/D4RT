@@ -302,7 +302,9 @@ class PointOdysseyDataset(Dataset):
                 info = np.load(info_path, allow_pickle=True)
                 trajs_3d_shape = info['trajs_3d'].astype(np.float32)
 
-                if len(trajs_3d_shape) and trajs_3d_shape[1] > self.N:
+                # Relax requirement: we only need a minimum number of trajectory points
+                # Queries are sampled independently from the image, not from trajectories
+                if len(trajs_3d_shape) and trajs_3d_shape[1] > 10:
                 
                     for stride in strides:
                         for ii in range(0,len(os.listdir(rgb_path))-self.S*stride+1, clip_step):
@@ -359,63 +361,43 @@ class PointOdysseyDataset(Dataset):
         
         return boundary_mask.astype(np.float32)
     
-    def sample_queries(self, depth_maps, trajs_2d, T=None):
+    def sample_queries(self, depth_maps, trajs_2d, visibs=None, valids=None, T=None):
         """
         Sample queries according to the strategy
+        Ensures that sampled points are visible and valid at t_src frames
         
         Args:
             depth_maps: (T, H, W) depth maps
             trajs_2d: (T, N, 2) existing trajectories (for reference)
+            visibs: (T, N) visibility flags for trajectories (optional)
+            valids: (T, N) validity flags for trajectories (optional)
             T: number of frames
         
         Returns:
-            coords_uv: (N, 2) normalized 2D coordinates
-            t_src: (N,) source frame indices
-            t_tgt: (N,) target frame indices
-            t_cam: (N,) camera reference frame indices
+            coords_uv: (num_queries, 2) normalized 2D coordinates
+            t_src: (num_queries,) source frame indices
+            t_tgt: (num_queries,) target frame indices
+            t_cam: (num_queries,) camera reference frame indices
         """
         if T is None:
             T = depth_maps.shape[0]
         H, W = depth_maps.shape[1:3]
         
-        # Compute boundaries for middle frame
-        mid_frame = T // 2
-        boundary_mask = self.compute_boundaries(depth_maps[mid_frame])
+        # Create validity masks for each frame based on depth maps
+        # A pixel is valid if it has valid depth (> 0) and is within image bounds
+        validity_masks = []
+        for t in range(T):
+            depth_mask = (depth_maps[t] > 0).astype(np.float32)
+            # Also avoid 1px edge for consistency with trajectory filtering
+            edge_mask = np.ones((H, W), dtype=np.float32)
+            edge_mask[0, :] = 0
+            edge_mask[-1, :] = 0
+            edge_mask[:, 0] = 0
+            edge_mask[:, -1] = 0
+            validity_mask = depth_mask * edge_mask
+            validity_masks.append(validity_mask)
         
-        # Number of queries on boundaries
-        num_boundary_queries = int(self.num_queries * self.boundary_ratio)
-        num_random_queries = self.num_queries - num_boundary_queries
-        
-        # Sample boundary queries
-        boundary_pixels = np.where(boundary_mask > 0.5)
-        if len(boundary_pixels[0]) > 0:
-            boundary_indices = np.random.choice(
-                len(boundary_pixels[0]),
-                size=min(num_boundary_queries, len(boundary_pixels[0])),
-                replace=False
-            )
-            boundary_coords = np.stack([
-                boundary_pixels[1][boundary_indices],  # u (width)
-                boundary_pixels[0][boundary_indices]   # v (height)
-            ], axis=1)
-        else:
-            boundary_coords = np.zeros((0, 2))
-        
-        # Sample random queries
-        num_random_queries_actual = num_random_queries + (num_boundary_queries - len(boundary_coords))
-        random_u = np.random.randint(0, W, size=num_random_queries_actual)
-        random_v = np.random.randint(0, H, size=num_random_queries_actual)
-        random_coords = np.stack([random_u, random_v], axis=1)
-        
-        # Combine coordinates
-        all_coords = np.concatenate([boundary_coords, random_coords], axis=0)
-        
-        # Normalize to [0, 1]
-        coords_uv = all_coords.astype(np.float32)
-        coords_uv[:, 0] /= W  # u
-        coords_uv[:, 1] /= H  # v
-        
-        # Sample time indices
+        # Sample time indices first
         # 40% with t_tgt = t_cam
         num_t_tgt_eq_t_cam = int(self.num_queries * self.t_tgt_eq_t_cam_ratio)
         
@@ -434,6 +416,59 @@ class PointOdysseyDataset(Dataset):
         t_src = np.concatenate([t_src_eq, t_src_remaining])
         t_tgt = np.concatenate([t_tgt_eq, t_tgt_remaining])
         t_cam = np.concatenate([t_cam_eq, t_cam_remaining])
+        
+        # Sample coordinates ensuring validity at t_src frames
+        all_coords = []
+        num_boundary_queries = int(self.num_queries * self.boundary_ratio)
+        
+        for i in range(self.num_queries):
+            t_src_i = t_src[i]
+            validity_mask = validity_masks[t_src_i]  # Use validity mask for t_src frame
+            
+            # Compute boundaries for t_src frame (if boundary sampling)
+            if i < num_boundary_queries:
+                boundary_mask = self.compute_boundaries(depth_maps[t_src_i])
+                # Combine with validity: boundary AND valid
+                valid_boundary_mask = boundary_mask * validity_mask
+                boundary_pixels = np.where(valid_boundary_mask > 0.5)
+                
+                if len(boundary_pixels[0]) > 0:
+                    # Sample from valid boundary pixels
+                    idx = np.random.randint(len(boundary_pixels[0]))
+                    u = boundary_pixels[1][idx]
+                    v = boundary_pixels[0][idx]
+                    all_coords.append([u, v])
+                else:
+                    # Fallback to valid random sampling
+                    valid_pixels = np.where(validity_mask > 0.5)
+                    if len(valid_pixels[0]) > 0:
+                        idx = np.random.randint(len(valid_pixels[0]))
+                        u = valid_pixels[1][idx]
+                        v = valid_pixels[0][idx]
+                        all_coords.append([u, v])
+                    else:
+                        # Last resort: sample anywhere (should be rare)
+                        u = np.random.randint(1, W-1)
+                        v = np.random.randint(1, H-1)
+                        all_coords.append([u, v])
+            else:
+                # Random sampling from valid pixels only
+                valid_pixels = np.where(validity_mask > 0.5)
+                if len(valid_pixels[0]) > 0:
+                    idx = np.random.randint(len(valid_pixels[0]))
+                    u = valid_pixels[1][idx]
+                    v = valid_pixels[0][idx]
+                    all_coords.append([u, v])
+                else:
+                    # Fallback: sample anywhere (should be rare)
+                    u = np.random.randint(1, W-1)
+                    v = np.random.randint(1, H-1)
+                    all_coords.append([u, v])
+        
+        # Convert to numpy array and normalize to [0, 1]
+        coords_uv = np.array(all_coords, dtype=np.float32)
+        coords_uv[:, 0] /= W  # u
+        coords_uv[:, 1] /= H  # v
         
         return coords_uv, t_src, t_tgt, t_cam
     
@@ -736,8 +771,10 @@ class PointOdysseyDataset(Dataset):
         assert(D==2)
         assert(S==self.S)
         
-        if N < self.N//2:
-            print('returning before cropping: N=%d; need at least N=%d' % (N, self.N//2))
+        # Relax the requirement: we just need enough points for query sampling
+        # Queries are sampled independently from the image, not from trajectories
+        if N < 10:  # Just need a minimum number for validation/filtering
+            print('returning before cropping: N=%d; need at least 10 points' % N)
             return None, False
         
         trajs_cam = utils.geom.apply_4x4_py(cams_T_world, trajs_world)
@@ -920,46 +957,79 @@ class PointOdysseyDataset(Dataset):
         
         N = trajs_2d.shape[1]
         
-        if N < self.N//2:
-            # print('N=%d' % (N))
+        # Since queries are sampled independently from the image (not from trajectories),
+        # we don't need to strictly limit N. We can keep more trajectory points if available,
+        # but still use FPS to ensure good distribution if we have too many.
+        max_traj_points = max(self.N, 100)  # Keep more points if available, but cap for efficiency
+        
+        if N < 10:  # Minimum threshold for valid trajectories
             return None, False
         
-        if N < self.N:
-            print('N=%d; ideally we want N=%d, but we will pad' % (N, self.N))
-
-        # even out the distribution, across initial positions and velocities
-        # fps based on xy0 and mean motion
-        xym = np.concatenate([trajs_2d[0], np.mean(trajs_2d[1:] - trajs_2d[:-1], axis=0)], axis=-1)
-        inds = utils.misc.farthest_point_sample_py(xym, self.N)
-        trajs_2d = trajs_2d[:,inds]
-        trajs_cam = trajs_cam[:,inds]
-        trajs_world = trajs_world[:,inds]
-        trajs_pix = trajs_pix[:,inds]
-        visibs = visibs[:,inds]
-        valids = valids[:,inds]
+        # Use FPS to sample trajectory points (for efficiency, but not strictly required for queries)
+        if N > max_traj_points:
+            # even out the distribution, across initial positions and velocities
+            # fps based on xy0 and mean motion
+            xym = np.concatenate([trajs_2d[0], np.mean(trajs_2d[1:] - trajs_2d[:-1], axis=0)], axis=-1)
+            inds = utils.misc.farthest_point_sample_py(xym, max_traj_points)
+            trajs_2d = trajs_2d[:,inds]
+            trajs_cam = trajs_cam[:,inds]
+            trajs_world = trajs_world[:,inds]
+            trajs_pix = trajs_pix[:,inds]
+            visibs = visibs[:,inds]
+            valids = valids[:,inds]
+            N = max_traj_points
 
         # we won't supervise with the extremes, but let's clamp anyway just to be safe
         trajs_2d = np.minimum(np.maximum(trajs_2d, np.array([-64,-64])), np.array([W+64, H+64])) # S,N,2
         trajs_pix = np.minimum(np.maximum(trajs_pix, np.array([-64,-64])), np.array([W+64, H+64])) # S,N,2
             
         N = trajs_2d.shape[1]
-        N_ = min(N, self.N)
-        inds = np.random.choice(N, N_, replace=False)
+        # Use all available trajectory points (up to a reasonable limit for batching)
+        # Since queries are sampled independently, we don't need to strictly pad to self.N
+        N_used = min(N, self.N)  # Use up to self.N for consistency, but can be less
+        if N > self.N:
+            # Randomly sample if we have more than self.N
+            inds = np.random.choice(N, N_used, replace=False)
+        else:
+            inds = np.arange(N)
+            N_used = N
 
-        # prep for batching, by fixing N (use actual S, not self.S)
+        # prep for batching, pad to self.N for consistent batch shapes
         trajs_2d_full = np.zeros((S, self.N, 2)).astype(np.float32)
         trajs_cam_full = np.zeros((S, self.N, 3)).astype(np.float32)
         trajs_world_full = np.zeros((S, self.N, 3)).astype(np.float32)
         trajs_pix_full = np.zeros((S, self.N, 2)).astype(np.float32)
         visibs_full = np.zeros((S, self.N)).astype(np.float32)
         valids_full = np.zeros((S, self.N)).astype(np.float32)
-        trajs_2d_full[:,:N_] = trajs_2d[:,inds]
-        trajs_cam_full[:,:N_] = trajs_cam[:,inds]
-        trajs_world_full[:,:N_] = trajs_world[:,inds]
-        trajs_pix_full[:,:N_] = trajs_pix[:,inds]
-        visibs_full[:,:N_] = visibs[:,inds]
-        valids_full[:,:N_] = valids[:,inds]
+        trajs_2d_full[:,:N_used] = trajs_2d[:,inds]
+        trajs_cam_full[:,:N_used] = trajs_cam[:,inds]
+        trajs_world_full[:,:N_used] = trajs_world[:,inds]
+        trajs_pix_full[:,:N_used] = trajs_pix[:,inds]
+        visibs_full[:,:N_used] = visibs[:,inds]
+        valids_full[:,:N_used] = valids[:,inds]
 
+        # Sample queries BEFORE converting to tensors (need numpy arrays for query sampling)
+        # Ensure depth shape is (S, H, W) for query sampling
+        depths_for_sampling = np.array(depths)
+        if len(depths_for_sampling.shape) == 4 and depths_for_sampling.shape[1] == 1:
+            depths_for_sampling = depths_for_sampling.squeeze(1)  # (S, 1, H, W) -> (S, H, W)
+        elif len(depths_for_sampling.shape) == 3:
+            pass  # Already (S, H, W)
+        else:
+            raise ValueError(f"Unexpected depth shape: {depths_for_sampling.shape}")
+        
+        # Generate queries: coords_uv are in normalized coordinates [0,1] relative to resized video
+        # The sample_queries method ensures sampled points have valid depth (>0) at their t_src frames
+        # This guarantees visibility and validity at the source frame
+        coords_uv, t_src, t_tgt, t_cam = self.sample_queries(
+            depths_for_sampling,
+            trajs_2d_full,  # (S, N, 2) - Only used for reference, not for sampling
+            visibs=None,  # Not used for coordinate sampling, validity determined by depth maps
+            valids=None,  # Not used for coordinate sampling, validity determined by depth maps
+            T=S
+        )
+        
+        # Now convert everything to tensors
         # Convert to float32 and normalize to [0, 1] for model input
         rgbs = torch.from_numpy(rgbs).float() / 255.0  # Convert uint8 [0,255] to float32 [0,1]
         rgbs = rgbs.permute(0,3,1,2)  # (S, H, W, 3) -> (S, 3, H, W)
@@ -983,22 +1053,16 @@ class PointOdysseyDataset(Dataset):
         valids = torch.from_numpy(valids_full).float()  # S,N
         pix_T_cams = torch.from_numpy(pix_T_cams).float()  # S,3,3
         cams_T_world = torch.from_numpy(cams_T_world).float()  # S,4,4
-
-        # Sample queries using the new strategy
-        # Convert depths to numpy for query sampling
-        depths_np = depths.numpy()
-        if depths_np.shape[1] == 1:
-            depths_np = depths_np.squeeze(1)  # (S, 1, H, W) -> (S, H, W)
-        coords_uv, t_src, t_tgt, t_cam = self.sample_queries(
-            depths_np,
-            trajs_2d.numpy(),
-            T=S
-        )
         
-        coords_uv = torch.from_numpy(coords_uv).float()  # (N, 2)
-        t_src = torch.from_numpy(t_src).long()  # (N,)
-        t_tgt = torch.from_numpy(t_tgt).long()  # (N,)
-        t_cam = torch.from_numpy(t_cam).long()  # (N,)
+        # Convert to tensors - queries are ready for network input
+        coords_uv = torch.from_numpy(coords_uv).float()  # (num_queries, 2) normalized [0,1]
+        t_src = torch.from_numpy(t_src).long()  # (num_queries,)
+        t_tgt = torch.from_numpy(t_tgt).long()  # (num_queries,)
+        t_cam = torch.from_numpy(t_cam).long()  # (num_queries,)
+        
+        # Ensure we have exactly num_queries queries
+        assert coords_uv.shape[0] == self.num_queries, \
+            f"Expected {self.num_queries} queries, got {coords_uv.shape[0]}"
 
         # Convert aspect_ratio to tensor if it's a scalar
         if isinstance(aspect_ratio, (int, float)):
