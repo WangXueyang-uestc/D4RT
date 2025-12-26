@@ -361,41 +361,50 @@ class PointOdysseyDataset(Dataset):
         
         return boundary_mask.astype(np.float32)
     
-    def sample_queries(self, depth_maps, trajs_2d, visibs=None, valids=None, T=None):
+    def sample_queries(self, trajs_2d, trajs_world, trajs_cam, visibs, valids, depth_maps, cams_T_world, T=None):
         """
-        Sample queries according to the strategy
-        Ensures that sampled points are visible and valid at t_src frames
+        Sample queries from trajectory points (trajs_2d) to ensure we have ground truth data.
+        This method samples trajectory indices and corresponding time frames.
         
         Args:
-            depth_maps: (T, H, W) depth maps
-            trajs_2d: (T, N, 2) existing trajectories (for reference)
-            visibs: (T, N) visibility flags for trajectories (optional)
-            valids: (T, N) validity flags for trajectories (optional)
+            trajs_2d: (T, N, 2) 2D trajectory coordinates in pixel space
+            trajs_world: (T, N, 3) 3D trajectory coordinates in world space (GT for 3D)
+            trajs_cam: (T, N, 3) 3D trajectory coordinates in camera space
+            visibs: (T, N) visibility flags for trajectories
+            valids: (T, N) validity flags for trajectories
+            depth_maps: (T, H, W) depth maps (for boundary computation)
+            cams_T_world: (T, 4, 4) camera-to-world transformation matrices
             T: number of frames
         
         Returns:
-            coords_uv: (num_queries, 2) normalized 2D coordinates
+            coords_uv: (num_queries, 2) normalized 2D coordinates at t_src [0,1]
             t_src: (num_queries,) source frame indices
             t_tgt: (num_queries,) target frame indices
             t_cam: (num_queries,) camera reference frame indices
+            gt_3d: (num_queries, 3) GT 3D coordinates at t_tgt in t_cam camera frame
+            gt_2d_src: (num_queries, 2) GT 2D coordinates at t_src (from trajs_2d)
+            gt_2d_tgt: (num_queries, 2) GT 2D coordinates at t_tgt (from trajs_2d)
+            gt_visibility_src: (num_queries,) GT visibility at t_src (from visibs)
+            gt_visibility_tgt: (num_queries,) GT visibility at t_tgt (from visibs)
+            traj_indices: (num_queries,) trajectory point indices used for sampling
         """
         if T is None:
-            T = depth_maps.shape[0]
+            T = trajs_2d.shape[0]
+        N = trajs_2d.shape[1]
         H, W = depth_maps.shape[1:3]
         
-        # Create validity masks for each frame based on depth maps
-        # A pixel is valid if it has valid depth (> 0) and is within image bounds
-        validity_masks = []
+        # Ensure we have enough trajectory points
+        if N < self.num_queries:
+            # If we have fewer trajectories than queries, we'll sample with replacement
+            # but this should be rare after filtering
+            raise ValueError(f"Not enough trajectory points: {N} < {self.num_queries}")
+        
+        # Compute boundaries for each frame (used for weighting trajectory selection)
+        # We compute boundaries for all frames, not just the middle frame
+        boundary_masks = []
         for t in range(T):
-            depth_mask = (depth_maps[t] > 0).astype(np.float32)
-            # Also avoid 1px edge for consistency with trajectory filtering
-            edge_mask = np.ones((H, W), dtype=np.float32)
-            edge_mask[0, :] = 0
-            edge_mask[-1, :] = 0
-            edge_mask[:, 0] = 0
-            edge_mask[:, -1] = 0
-            validity_mask = depth_mask * edge_mask
-            validity_masks.append(validity_mask)
+            boundary_mask = self.compute_boundaries(depth_maps[t])
+            boundary_masks.append(boundary_mask)
         
         # Sample time indices first
         # 40% with t_tgt = t_cam
@@ -417,60 +426,115 @@ class PointOdysseyDataset(Dataset):
         t_tgt = np.concatenate([t_tgt_eq, t_tgt_remaining])
         t_cam = np.concatenate([t_cam_eq, t_cam_remaining])
         
-        # Sample coordinates ensuring validity at t_src frames
-        all_coords = []
+        # Sample trajectory indices
+        # Strategy: prefer trajectories that are on boundaries at t_src frame
         num_boundary_queries = int(self.num_queries * self.boundary_ratio)
+        
+        # Get all valid trajectory points at their respective t_src frames
+        valid_traj_mask = np.zeros((self.num_queries, N), dtype=bool)
+        boundary_weights = np.zeros((self.num_queries, N), dtype=np.float32)
         
         for i in range(self.num_queries):
             t_src_i = t_src[i]
-            validity_mask = validity_masks[t_src_i]  # Use validity mask for t_src frame
+            # Trajectory point is valid if it's visible and valid at t_src frame
+            valid_mask = (visibs[t_src_i] > 0) & (valids[t_src_i] > 0)
+            valid_traj_mask[i] = valid_mask
             
-            # Compute boundaries for t_src frame (if boundary sampling)
-            if i < num_boundary_queries:
-                boundary_mask = self.compute_boundaries(depth_maps[t_src_i])
-                # Combine with validity: boundary AND valid
-                valid_boundary_mask = boundary_mask * validity_mask
-                boundary_pixels = np.where(valid_boundary_mask > 0.5)
-                
-                if len(boundary_pixels[0]) > 0:
-                    # Sample from valid boundary pixels
-                    idx = np.random.randint(len(boundary_pixels[0]))
-                    u = boundary_pixels[1][idx]
-                    v = boundary_pixels[0][idx]
-                    all_coords.append([u, v])
-                else:
-                    # Fallback to valid random sampling
-                    valid_pixels = np.where(validity_mask > 0.5)
-                    if len(valid_pixels[0]) > 0:
-                        idx = np.random.randint(len(valid_pixels[0]))
-                        u = valid_pixels[1][idx]
-                        v = valid_pixels[0][idx]
-                        all_coords.append([u, v])
-                    else:
-                        # Last resort: sample anywhere (should be rare)
-                        u = np.random.randint(1, W-1)
-                        v = np.random.randint(1, H-1)
-                        all_coords.append([u, v])
+            # Compute boundary weights: check if trajectory point is on boundary at t_src
+            if i < num_boundary_queries and valid_mask.sum() > 0:
+                boundary_mask = boundary_masks[t_src_i]
+                traj_coords = trajs_2d[t_src_i]  # (N, 2) in pixel coordinates
+                # Check which trajectory points are on boundaries
+                for n in range(N):
+                    if valid_mask[n]:
+                        u, v = int(traj_coords[n, 0]), int(traj_coords[n, 1])
+                        # Clamp to image bounds
+                        u = np.clip(u, 0, W - 1)
+                        v = np.clip(v, 0, H - 1)
+                        if boundary_mask[v, u] > 0.5:
+                            boundary_weights[i, n] = 1.0
+                # If no boundary points found, use uniform weights
+                if boundary_weights[i].sum() == 0:
+                    boundary_weights[i, valid_mask] = 1.0
             else:
-                # Random sampling from valid pixels only
-                valid_pixels = np.where(validity_mask > 0.5)
-                if len(valid_pixels[0]) > 0:
-                    idx = np.random.randint(len(valid_pixels[0]))
-                    u = valid_pixels[1][idx]
-                    v = valid_pixels[0][idx]
-                    all_coords.append([u, v])
+                # For non-boundary queries, use uniform weights
+                boundary_weights[i, valid_mask] = 1.0
+        
+        # Sample trajectory indices based on weights
+        traj_indices = np.zeros(self.num_queries, dtype=np.int32)
+        for i in range(self.num_queries):
+            valid_mask = valid_traj_mask[i]
+            weights = boundary_weights[i, valid_mask]
+            
+            if weights.sum() == 0:
+                # Fallback: sample uniformly from all valid trajectories
+                valid_indices = np.where(valid_mask)[0]
+                if len(valid_indices) > 0:
+                    traj_indices[i] = np.random.choice(valid_indices)
                 else:
-                    # Fallback: sample anywhere (should be rare)
-                    u = np.random.randint(1, W-1)
-                    v = np.random.randint(1, H-1)
-                    all_coords.append([u, v])
+                    # Last resort: sample any trajectory (should be rare)
+                    traj_indices[i] = np.random.randint(0, N)
+            else:
+                # Sample according to weights (prefer boundary points)
+                valid_indices = np.where(valid_mask)[0]
+                probs = weights / weights.sum()
+                traj_indices[i] = np.random.choice(valid_indices, p=probs)
         
-        # Convert to numpy array and normalize to [0, 1]
-        coords_uv = np.array(all_coords, dtype=np.float32)
-        coords_uv[:, 0] /= W  # u
-        coords_uv[:, 1] /= H  # v
+        # Extract coordinates and GT data for sampled trajectories
+        coords_uv = np.zeros((self.num_queries, 2), dtype=np.float32)
+        gt_3d = np.zeros((self.num_queries, 3), dtype=np.float32)
+        gt_2d_src = np.zeros((self.num_queries, 2), dtype=np.float32)
+        gt_2d_tgt = np.zeros((self.num_queries, 2), dtype=np.float32)
+        gt_visibility_src = np.zeros(self.num_queries, dtype=np.float32)
+        gt_visibility_tgt = np.zeros(self.num_queries, dtype=np.float32)
         
-        return coords_uv, t_src, t_tgt, t_cam
+        for i in range(self.num_queries):
+            n = traj_indices[i]
+            t_src_i = t_src[i]
+            t_tgt_i = t_tgt[i]
+            t_cam_i = t_cam[i]
+            
+            # Extract 2D coordinates at t_src (normalize to [0,1])
+            coords_2d_src = trajs_2d[t_src_i, n]  # (2,) pixel coordinates
+            coords_uv[i, 0] = coords_2d_src[0] / W  # normalize u
+            coords_uv[i, 1] = coords_2d_src[1] / H  # normalize v
+            
+            # Extract GT 3D coordinates: t_tgt时刻的世界坐标，转换到t_cam时刻的相机坐标系
+            # 1. Get 3D world coordinates at t_tgt
+            point_world = trajs_world[t_tgt_i, n]  # (3,) world coordinates at t_tgt
+            
+            # 2. Get world-to-camera transformation at t_cam
+            # cams_T_world[t] transforms from world to camera coordinates at frame t
+            # (as used in: trajs_cam = apply_4x4_py(cams_T_world, trajs_world))
+            cam_T_world = cams_T_world[t_cam_i]  # (4, 4) world-to-camera transformation at t_cam
+            
+            # 3. Transform point from world to camera coordinates
+            point_world_homo = np.concatenate([point_world, np.array([1.0])])  # (4,)
+            point_cam_homo = cam_T_world @ point_world_homo  # (4,)
+            point_cam = point_cam_homo[:3] / (point_cam_homo[3] + 1e-8)  # (3,)
+            
+            gt_3d[i] = point_cam
+            
+            # Extract GT 2D coordinates (pixel coordinates)
+            gt_2d_src[i] = trajs_2d[t_src_i, n]  # (2,) pixel coordinates at t_src
+            gt_2d_tgt[i] = trajs_2d[t_tgt_i, n]  # (2,) pixel coordinates at t_tgt
+            
+            # Extract GT visibility
+            gt_visibility_src[i] = visibs[t_src_i, n]
+            gt_visibility_tgt[i] = visibs[t_tgt_i, n]
+        
+        return {
+            'coords_uv': coords_uv,
+            't_src': t_src,
+            't_tgt': t_tgt,
+            't_cam': t_cam,
+            'gt_3d': gt_3d,  # (num_queries, 3) 3D coordinates at t_tgt in t_cam camera frame
+            'gt_2d_src': gt_2d_src,
+            'gt_2d_tgt': gt_2d_tgt,
+            'gt_visibility_src': gt_visibility_src,
+            'gt_visibility_tgt': gt_visibility_tgt,
+            'traj_indices': traj_indices
+        }
     
     def apply_photometric_augmentation(self, rgbs):
         """
@@ -957,15 +1021,14 @@ class PointOdysseyDataset(Dataset):
         
         N = trajs_2d.shape[1]
         
-        # Since queries are sampled independently from the image (not from trajectories),
-        # we don't need to strictly limit N. We can keep more trajectory points if available,
-        # but still use FPS to ensure good distribution if we have too many.
-        max_traj_points = max(self.N, 100)  # Keep more points if available, but cap for efficiency
+        # We need at least num_queries trajectory points for sampling queries
+        # But we also want to keep more points if available for better diversity
+        max_traj_points = max(self.num_queries, 100)  # Need at least num_queries points
         
-        if N < 10:  # Minimum threshold for valid trajectories
+        if N < self.num_queries:  # Need at least num_queries trajectory points
             return None, False
         
-        # Use FPS to sample trajectory points (for efficiency, but not strictly required for queries)
+        # Use FPS to sample trajectory points if we have too many (for efficiency)
         if N > max_traj_points:
             # even out the distribution, across initial positions and velocities
             # fps based on xy0 and mean motion
@@ -1009,7 +1072,12 @@ class PointOdysseyDataset(Dataset):
         valids_full[:,:N_used] = valids[:,inds]
 
         # Sample queries BEFORE converting to tensors (need numpy arrays for query sampling)
-        # Ensure depth shape is (S, H, W) for query sampling
+        # Ensure we have enough trajectory points for sampling
+        if N < self.num_queries:
+            # Need at least num_queries trajectory points
+            return None, False
+        
+        # Ensure depth shape is (S, H, W) for boundary computation
         depths_for_sampling = np.array(depths)
         if len(depths_for_sampling.shape) == 4 and depths_for_sampling.shape[1] == 1:
             depths_for_sampling = depths_for_sampling.squeeze(1)  # (S, 1, H, W) -> (S, H, W)
@@ -1018,16 +1086,30 @@ class PointOdysseyDataset(Dataset):
         else:
             raise ValueError(f"Unexpected depth shape: {depths_for_sampling.shape}")
         
-        # Generate queries: coords_uv are in normalized coordinates [0,1] relative to resized video
-        # The sample_queries method ensures sampled points have valid depth (>0) at their t_src frames
-        # This guarantees visibility and validity at the source frame
-        coords_uv, t_src, t_tgt, t_cam = self.sample_queries(
-            depths_for_sampling,
-            trajs_2d_full,  # (S, N, 2) - Only used for reference, not for sampling
-            visibs=None,  # Not used for coordinate sampling, validity determined by depth maps
-            valids=None,  # Not used for coordinate sampling, validity determined by depth maps
+        # Sample queries from trajectory points - this ensures we have GT data
+        # Note: cams_T_world should be (S, 4, 4) after temporal subsampling if applicable
+        # We use the cams_T_world that corresponds to the current S frames
+        query_data = self.sample_queries(
+            trajs_2d_full,  # (S, N, 2) trajectory 2D coordinates
+            trajs_world_full,  # (S, N, 3) trajectory 3D world coordinates (GT)
+            trajs_cam_full,  # (S, N, 3) trajectory 3D camera coordinates
+            visibs_full,  # (S, N) visibility flags
+            valids_full,  # (S, N) validity flags
+            depths_for_sampling,  # (S, H, W) depth maps for boundary computation
+            cams_T_world,  # (S, 4, 4) world-to-camera transformation matrices
             T=S
         )
+        
+        # Extract query data
+        coords_uv = query_data['coords_uv']  # (num_queries, 2) normalized [0,1]
+        t_src = query_data['t_src']  # (num_queries,)
+        t_tgt = query_data['t_tgt']  # (num_queries,)
+        t_cam = query_data['t_cam']  # (num_queries,)
+        gt_3d = query_data['gt_3d']  # (num_queries, 3) GT 3D at t_tgt in t_cam camera frame
+        gt_2d_src = query_data['gt_2d_src']  # (num_queries, 2) GT 2D at t_src
+        gt_2d_tgt = query_data['gt_2d_tgt']  # (num_queries, 2) GT 2D at t_tgt
+        gt_visibility_src = query_data['gt_visibility_src']  # (num_queries,) GT visibility at t_src
+        gt_visibility_tgt = query_data['gt_visibility_tgt']  # (num_queries,) GT visibility at t_tgt
         
         # Now convert everything to tensors
         # Convert to float32 and normalize to [0, 1] for model input
@@ -1054,11 +1136,18 @@ class PointOdysseyDataset(Dataset):
         pix_T_cams = torch.from_numpy(pix_T_cams).float()  # S,3,3
         cams_T_world = torch.from_numpy(cams_T_world).float()  # S,4,4
         
-        # Convert to tensors - queries are ready for network input
+        # Convert query data to tensors
         coords_uv = torch.from_numpy(coords_uv).float()  # (num_queries, 2) normalized [0,1]
         t_src = torch.from_numpy(t_src).long()  # (num_queries,)
         t_tgt = torch.from_numpy(t_tgt).long()  # (num_queries,)
         t_cam = torch.from_numpy(t_cam).long()  # (num_queries,)
+        
+        # Convert GT data to tensors
+        gt_3d = torch.from_numpy(gt_3d).float()  # (num_queries, 3) GT 3D at t_tgt in t_cam camera frame
+        gt_2d_src = torch.from_numpy(gt_2d_src).float()  # (num_queries, 2)
+        gt_2d_tgt = torch.from_numpy(gt_2d_tgt).float()  # (num_queries, 2)
+        gt_visibility_src = torch.from_numpy(gt_visibility_src).float()  # (num_queries,)
+        gt_visibility_tgt = torch.from_numpy(gt_visibility_tgt).float()  # (num_queries,)
         
         # Ensure we have exactly num_queries queries
         assert coords_uv.shape[0] == self.num_queries, \
@@ -1085,6 +1174,12 @@ class PointOdysseyDataset(Dataset):
             't_src': t_src,
             't_tgt': t_tgt,
             't_cam': t_cam,
+            # Ground truth data for queries (computed at dataset loading time)
+            'gt_3d': gt_3d,  # (num_queries, 3) GT 3D coordinates at t_tgt in t_cam camera frame
+            'gt_2d_src': gt_2d_src,  # (num_queries, 2) GT 2D coordinates at t_src
+            'gt_2d_tgt': gt_2d_tgt,  # (num_queries, 2) GT 2D coordinates at t_tgt (for training)
+            'gt_visibility_src': gt_visibility_src,  # (num_queries,) GT visibility at t_src
+            'gt_visibility_tgt': gt_visibility_tgt,  # (num_queries,) GT visibility at t_tgt (for training)
             'aspect_ratio': aspect_ratio,
             'annotations_path': annotations_path,
         }
@@ -1111,10 +1206,17 @@ class PointOdysseyDataset(Dataset):
                 'cams_T_world': torch.zeros((self.S, 4, 4), dtype=torch.float32),
                 'visibs': torch.zeros((self.S, self.N), dtype=torch.float32),
                 'valids': torch.zeros((self.S, self.N), dtype=torch.float32),
-                'coords_uv': torch.zeros((self.num_queries, 2), dtype=torch.float32),  # num_queries (2048) query coordinates
+                # Query data
+                'coords_uv': torch.zeros((self.num_queries, 2), dtype=torch.float32),
                 't_src': torch.zeros((self.num_queries,), dtype=torch.long),
                 't_tgt': torch.zeros((self.num_queries,), dtype=torch.long),
                 't_cam': torch.zeros((self.num_queries,), dtype=torch.long),
+                # Ground truth data for queries
+                'gt_3d': torch.zeros((self.num_queries, 3), dtype=torch.float32),  # GT 3D at t_tgt in t_cam camera frame
+                'gt_2d_src': torch.zeros((self.num_queries, 2), dtype=torch.float32),
+                'gt_2d_tgt': torch.zeros((self.num_queries, 2), dtype=torch.float32),
+                'gt_visibility_src': torch.zeros((self.num_queries,), dtype=torch.float32),
+                'gt_visibility_tgt': torch.zeros((self.num_queries,), dtype=torch.float32),
                 'aspect_ratio': torch.tensor(1.0, dtype=torch.float32),
                 'annotations_path': '',
             }
